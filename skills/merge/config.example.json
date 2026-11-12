@@ -1,0 +1,32 @@
+{
+  "repos": {
+    "my_backend": {
+      "github": "org/my_backend",
+      "path": "/path/to/my_backend"
+    },
+    "my_frontend": {
+      "github": "org/my_frontend",
+      "path": "/path/to/my_frontend"
+    }
+  },
+  "merge": {
+    "poll_seconds": {
+      "default": 10,
+      "fast": 2,
+      "approval": 30
+    },
+    "sync_base": true,
+    "repos": {
+      "my_backend": {
+        "short": "backend",
+        "labels": [
+          "ready for merge"
+        ]
+      },
+      "my_frontend": {
+        "short": "frontend",
+        "labels": []
+      }
+    }
+  }
+}

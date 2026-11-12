@@ -1,0 +1,11 @@
+{
+  "name": "builder",
+  "version": "0.1.0",
+  "description": "builder skills: small Claude Code skills for shipping work.",
+  "author": {
+    "name": "rishikeshDpp"
+  },
+  "repository": "https://github.com/rishikeshDpp/builder",
+  "license": "MIT",
+  "keywords": ["skills", "pull-requests", "merge", "ci"]
+}

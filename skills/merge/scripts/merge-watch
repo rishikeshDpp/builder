@@ -1,0 +1,443 @@
+#!/usr/bin/env python3
+"""Merge watcher: watches confirmed PRs, merges when green, exits when Claude is needed.
+
+Config: ~/.config/builder/config.json (merge section); ~/.config/forge/config.json repos are read if present.
+State: ~/.config/builder/merge/<run>.json.
+
+Usage:
+  merge-watch [--dry-run] [--seconds N] <ref>...   new run; ref = key#N, short#N, owner/repo#N or PR URL
+  merge-watch --run <id|path>                      resume a run
+Exit codes: 10 merged, 11 check failed, 12 conflict, 13 dirty worktree, 1 error, 0 dry-run done.
+"""
+import json, os, re, ssl, subprocess, sys, time, urllib.error, urllib.request
+
+HOME = os.environ.get("BUILDER_HOME") or os.path.expanduser("~/.config/builder")
+FORGE = os.environ.get("FORGE_HOME") or os.path.expanduser("~/.config/forge")
+API = "https://api.github.com"
+FAIL = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR"}
+OK = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+CODES = {"merged": 10, "check_failed": 11, "conflict": 12, "dirty": 13, "error": 1}
+GRACE = 600
+CTX = ssl.create_default_context()
+if os.path.exists("/etc/ssl/cert.pem"):
+    CTX.load_verify_locations("/etc/ssl/cert.pem")
+
+
+class Stop(Exception):
+    def __init__(self, reason, pr=None, detail=""):
+        super().__init__(reason)
+        self.reason, self.pr, self.detail = reason, pr, detail
+
+
+def now():
+    return time.time()
+
+
+def log(msg):
+    print(time.strftime("[%H:%M:%S] ") + msg, flush=True)
+
+
+def sh(args, cwd=None, check=True):
+    r = subprocess.run(args, cwd=cwd, capture_output=True, text=True)
+    if check and r.returncode:
+        raise Stop("error", detail="%s: %s" % (" ".join(args[:3]), (r.stderr or r.stdout).strip()[-300:]))
+    return r
+
+
+def iso(s):
+    return time.mktime(time.strptime(s[:19], "%Y-%m-%dT%H:%M:%S")) - time.timezone if s else 0
+
+
+class GH:
+    def __init__(self, token):
+        self.token, self.etags, self.cache = token, {}, {}
+        self.n = self.n304 = self.gql = 0
+
+    def req(self, method, path, body=None):
+        url = path if path.startswith("http") else API + path
+        h = {"Authorization": "Bearer " + self.token, "Accept": "application/vnd.github+json",
+             "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "merge-watch"}
+        if method == "GET" and url in self.etags:
+            h["If-None-Match"] = self.etags[url]
+        data = json.dumps(body).encode() if body is not None else None
+        backoff, tries = 60, 0
+        while True:
+            self.n += 1
+            try:
+                with urllib.request.urlopen(urllib.request.Request(url, data, h, method=method), timeout=30, context=CTX) as r:
+                    out = json.loads(r.read() or b"null")
+                    if method == "GET" and r.headers.get("ETag"):
+                        self.etags[url], self.cache[url] = r.headers["ETag"], out
+                    return out, True
+            except urllib.error.HTTPError as e:
+                if e.code == 304:
+                    self.n304 += 1
+                    return self.cache[url], False
+                text = e.read().decode(errors="ignore")
+                hd = e.headers
+                if e.code in (403, 429) and (hd.get("Retry-After") or hd.get("X-RateLimit-Remaining") == "0" or "rate limit" in text.lower()):
+                    if hd.get("Retry-After"):
+                        wait = int(hd["Retry-After"])
+                    elif hd.get("X-RateLimit-Remaining") == "0":
+                        wait = max(int(hd.get("X-RateLimit-Reset", "0")) - int(now()), 1) + 1
+                    else:
+                        wait, backoff = backoff, min(backoff * 2, 900)
+                    log("rate limited, waiting %ss" % wait)
+                    time.sleep(wait)
+                    continue
+                if e.code >= 500 and tries < 5:
+                    tries += 1
+                    time.sleep(5 * tries)
+                    continue
+                raise Stop("error", detail="HTTP %s %s" % (e.code, url.replace(API, "")))
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                if tries < 8 and "CERTIFICATE" not in str(e):
+                    log("network error, retrying: %s" % e)
+                    tries += 1
+                    time.sleep(min(5 * tries, 60))
+                    continue
+                raise Stop("error", detail="network: %s" % e)
+
+    def graphql(self, q):
+        self.gql += 1
+        out, _ = self.req("POST", "/graphql", {"query": q})
+        if out.get("errors"):
+            raise Stop("error", detail="graphql: %s" % out["errors"][0].get("message", "")[:200])
+        return out["data"]
+
+
+def load_cfg():
+    cfg = json.load(open(os.path.join(HOME, "config.json")))
+    m = cfg.get("merge") or {}
+    repos = {}
+    try:
+        fcfg = json.load(open(os.path.join(FORGE, "config.json")))
+    except Exception:
+        fcfg = {}
+    for src in (fcfg, cfg):
+        for key, r in (src.get("repos") or {}).items():
+            repos.setdefault(key, {}).update({k: v for k, v in r.items() if k in ("github", "path") and v})
+    for key, r in (m.get("repos") or {}).items():
+        repos.setdefault(key, {}).update(r)
+    for key, r in repos.items():
+        r.setdefault("github", "")
+        r.setdefault("path", "")
+        r.setdefault("short", key)
+        r.setdefault("labels", [])
+    poll = {"default": 10, "fast": 2, "approval": 30}
+    poll.update(m.get("poll_seconds") or {})
+    return repos, poll, m.get("sync_base", True)
+
+
+def parse_ref(ref, repos):
+    m = re.match(r"https://github\.com/([^/]+/[^/]+)/pull/(\d+)", ref) or re.match(r"(.+)#(\d+)$", ref)
+    if not m:
+        raise Stop("error", detail="bad ref " + ref)
+    name, num = m.group(1), int(m.group(2))
+    for key, r in repos.items():
+        if name in (key, r["short"], r["github"]) or (r["github"] and name == r["github"].split("/")[1]):
+            if r["github"]:
+                return key, r, num
+    if "/" in name:
+        return name, {"github": name, "path": "", "short": name.split("/")[1], "labels": []}, num
+    raise Stop("error", detail="unknown repo " + name)
+
+
+class Watch:
+    def __init__(self, state, path, dry, repos, poll, sync_base):
+        self.s, self.path, self.dry = state, path, dry
+        self.repos, self.poll, self.sync_base = repos, poll, sync_base
+        token = sh(["gh", "auth", "token"]).stdout.strip()
+        self.gh = GH(token)
+        self.last = {}
+
+    def save(self):
+        if self.dry:
+            return
+        tmp = self.path + ".tmp"
+        json.dump(self.s, open(tmp, "w"), indent=2)
+        os.replace(tmp, self.path)
+
+    def notify(self, msg):
+        if self.dry:
+            log("would notify: " + msg)
+            return
+        subprocess.run(["osascript", "-e", 'display notification "%s" with title "merge"' % msg.replace('"', "'")], capture_output=True)
+
+    def name(self, pr):
+        return "%s #%s" % (pr["short"], pr["number"])
+
+    def say(self, pr, decision, detail=""):
+        line = decision + (" (%s)" % detail if detail else "")
+        if self.last.get(pr["number"]) != line:
+            self.last[pr["number"]] = line
+            log("%s#%s %s" % (pr["short"], pr["number"], line))
+
+    def poll_rest(self, pr):
+        slug, n = pr["slug"], pr["number"]
+        pull, c1 = self.gh.req("GET", "/repos/%s/pulls/%s" % (slug, n))
+        pr["head_sha"], pr["head"], pr["base"] = pull["head"]["sha"], pull["head"]["ref"], pull["base"]["ref"]
+        if pull.get("merged") or pull.get("state") == "closed":
+            return True, pull
+        _, c2 = self.gh.req("GET", "/repos/%s/commits/%s/check-runs?per_page=100" % (slug, pr["head_sha"]))
+        _, c3 = self.gh.req("GET", "/repos/%s/commits/%s/status" % (slug, pr["head_sha"]))
+        br, c4 = self.gh.req("GET", "/repos/%s/branches/%s" % (slug, pr["base"]))
+        pr["behind"] = pr.get("behind", 0)
+        if c1 or c4:
+            cmp, _ = self.gh.req("GET", "/repos/%s/compare/%s...%s" % (slug, br["commit"]["sha"], pr["head_sha"]))
+            pr["behind"] = cmp.get("behind_by", 0)
+        return c1 or c2 or c3 or c4, pull
+
+    def query(self, prs):
+        parts = []
+        for i, pr in enumerate(prs):
+            o, r = pr["slug"].split("/")
+            n = pr["number"]
+            parent = ('parent: pullRequests(headRefName:%s, states:MERGED, first:1){nodes{number baseRefName}}' % json.dumps(pr["base"])) if pr.get("base") else ""
+            parts.append('''p%d: repository(owner:%s, name:%s) { defaultBranchRef{name} %s
+ pullRequest(number:%d){ state merged isDraft mergeable mergeStateStatus reviewDecision headRefName headRefOid baseRefName
+  labels(first:30){nodes{name}}
+  commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{__typename
+   ... on CheckRun{name status conclusion startedAt completedAt detailsUrl isRequired(pullRequestNumber:%d)}
+   ... on StatusContext{context state createdAt targetUrl isRequired(pullRequestNumber:%d)}}}}}}}}}''' % (i, json.dumps(o), json.dumps(r), parent, n, n, n))
+        d = self.gh.graphql("query{" + "\n".join(parts) + "}")
+        return [d["p%d" % i] for i in range(len(prs))]
+
+    def decide(self, pr, repo):
+        p = repo["pullRequest"]
+        default = (repo.get("defaultBranchRef") or {}).get("name") or "main"
+        pr["method"] = "squash" if p["baseRefName"] in (default, "main", "master") else "merge"
+        pr["head_sha"], pr["head"], pr["base"] = p["headRefOid"], p["headRefName"], p["baseRefName"]
+        if p["merged"]:
+            return "merged", ""
+        if p["state"] != "OPEN":
+            raise Stop("error", pr, "PR is closed")
+        if p["isDraft"]:
+            raise Stop("error", pr, "PR is a draft")
+        have = {l["name"] for l in p["labels"]["nodes"]}
+        missing = [l for l in pr["labels"] if l not in have]
+        if missing:
+            return "add_label", ", ".join(missing)
+        par = (repo.get("parent") or {}).get("nodes") or []
+        if par and p["baseRefName"] != default:
+            return "retarget", par[0]["baseRefName"]
+        latest = {}
+        for c in (((p["commits"]["nodes"] or [{}])[0].get("commit") or {}).get("statusCheckRollup") or {}).get("contexts", {}).get("nodes", []):
+            if c["__typename"] == "CheckRun":
+                k, t = c["name"], iso(c.get("startedAt"))
+                done, concl = c["status"] == "COMPLETED", c.get("conclusion") or ""
+                end, url = iso(c.get("completedAt")), c.get("detailsUrl")
+            else:
+                k, t = c["context"], iso(c.get("createdAt"))
+                done, concl = c["state"] not in ("PENDING", "EXPECTED"), c["state"]
+                end, url = t, c.get("targetUrl")
+            if c.get("isRequired") and (k not in latest or t >= latest[k]["t"]):
+                latest[k] = {"t": t, "done": done, "concl": concl, "end": end, "url": url}
+        acted = pr.get("acted_at", 0)
+        failed = [k for k, c in latest.items() if c["done"] and c["concl"] in FAIL
+                  and not (c["end"] < acted and now() - acted < GRACE)]
+        if failed:
+            return "check_failed", "; ".join("%s %s" % (k, latest[k]["url"] or "") for k in failed)
+        if p["mergeable"] == "CONFLICTING" or p["mergeStateStatus"] == "DIRTY":
+            return "sync_base", "conflict reported"
+        if p["mergeStateStatus"] == "BEHIND" or (self.sync_base and pr.get("behind", 0) > 0):
+            return "sync_base", "%s behind" % (pr.get("behind") or "")
+        pending = [k for k, c in latest.items() if not (c["done"] and c["concl"] in OK)]
+        running = [k for k in pending if not latest[k]["done"]]
+        if pending:
+            return ("wait_fast" if len(pending) == 1 and running else "wait"), ", ".join(pending)
+        if "UNKNOWN" in (p["mergeable"], p["mergeStateStatus"]):
+            return "wait", "mergeability computing"
+        if p["reviewDecision"] in ("REVIEW_REQUIRED", "CHANGES_REQUESTED"):
+            return "approval", p["reviewDecision"].lower()
+        if p["mergeStateStatus"] in ("CLEAN", "HAS_HOOKS", "UNSTABLE") and p["mergeable"] == "MERGEABLE":
+            return "merge", pr["method"]
+        return "wait", "blocked: " + p["mergeStateStatus"].lower()
+
+    def worktree(self, pr):
+        wt = pr.get("worktree")
+        if wt and os.path.isdir(wt):
+            return wt
+        root = self.repos.get(pr["key"], {}).get("path")
+        if not root or not os.path.isdir(root):
+            raise Stop("error", pr, "no local path for " + pr["key"])
+        cur = None
+        for line in sh(["git", "-C", root, "worktree", "list", "--porcelain"]).stdout.splitlines():
+            if line.startswith("worktree "):
+                cur = line[9:]
+            elif line == "branch refs/heads/" + pr["head"] and os.path.isdir(cur):
+                pr["worktree"] = cur
+                return cur
+        wt = "%s-merge-%s" % (root.rstrip("/"), pr["number"])
+        sh(["git", "-C", root, "fetch", "origin", pr["head"]])
+        if sh(["git", "-C", root, "rev-parse", "--verify", "-q", "refs/heads/" + pr["head"]], check=False).returncode == 0:
+            sh(["git", "-C", root, "worktree", "add", wt, pr["head"]])
+        else:
+            sh(["git", "-C", root, "worktree", "add", "--track", "-b", pr["head"], wt, "origin/" + pr["head"]])
+        pr["worktree"] = wt
+        return wt
+
+    def sync_base_now(self, pr):
+        wt = self.worktree(pr)
+        if sh(["git", "-C", wt, "status", "--porcelain", "--untracked-files=no"]).stdout.strip():
+            raise Stop("dirty", pr, wt)
+        sh(["git", "-C", wt, "fetch", "origin", pr["head"], pr["base"]])
+        local = sh(["git", "-C", wt, "rev-parse", "HEAD"]).stdout.strip()
+        remote = sh(["git", "-C", wt, "rev-parse", "origin/" + pr["head"]]).stdout.strip()
+        if local != remote:
+            if sh(["git", "-C", wt, "merge-base", "--is-ancestor", local, remote], check=False).returncode:
+                raise Stop("error", pr, "local branch has commits not on origin in " + wt)
+            sh(["git", "-C", wt, "merge", "--ff-only", "origin/" + pr["head"]])
+        r = sh(["git", "-C", wt, "merge", "--no-edit", "origin/" + pr["base"]], check=False)
+        if r.returncode:
+            files = sh(["git", "-C", wt, "diff", "--name-only", "--diff-filter=U"], check=False).stdout.split()
+            sh(["git", "-C", wt, "merge", "--abort"], check=False)
+            if files:
+                self.notify("Conflict on " + self.name(pr))
+                raise Stop("conflict", pr, "worktree %s; files: %s" % (wt, " ".join(files)))
+            raise Stop("error", pr, "merge failed: " + (r.stderr or r.stdout).strip()[-300:])
+        if sh(["git", "-C", wt, "rev-parse", "HEAD"]).stdout.strip() != remote:
+            sh(["git", "-C", wt, "push", "origin", "HEAD:refs/heads/" + pr["head"]])
+            log("%s#%s merged origin/%s and pushed" % (pr["short"], pr["number"], pr["base"]))
+        pr["acted_at"], pr["behind"] = now(), 0
+
+    def act(self, pr, decision, detail):
+        n, slug = str(pr["number"]), pr["slug"]
+        dry = self.dry
+        if decision == "merged":
+            pr["status"] = "merged"
+            self.notify("Merged " + self.name(pr))
+            raise Stop("merged", pr)
+        if decision == "check_failed":
+            if dry:
+                return self.poll["default"]
+            self.notify("CI failed on %s, fixing" % self.name(pr))
+            raise Stop("check_failed", pr, detail)
+        if decision == "add_label":
+            if not dry:
+                for l in pr["labels"]:
+                    sh(["gh", "pr", "edit", n, "-R", slug, "--add-label", l])
+                pr["acted_at"] = now()
+            return self.poll["default"]
+        if decision == "retarget":
+            if not dry:
+                sh(["gh", "pr", "edit", n, "-R", slug, "--base", detail])
+                pr["acted_at"], pr["force"] = now(), True
+            return self.poll["default"]
+        if decision == "sync_base":
+            if not dry:
+                self.sync_base_now(pr)
+            return self.poll["default"]
+        if decision == "approval":
+            if not pr.get("approval_notified"):
+                self.notify("Approval pending on " + self.name(pr))
+                pr["approval_notified"] = True
+            return self.poll["approval"]
+        pr["approval_notified"] = False
+        if decision == "merge":
+            if dry:
+                return self.poll["default"]
+            r = sh(["gh", "pr", "merge", n, "-R", slug, "--" + detail, "--match-head-commit", pr["head_sha"]], check=False)
+            if r.returncode:
+                pr["merge_fail"] = pr.get("merge_fail", 0) + 1
+                if pr["merge_fail"] >= 3:
+                    raise Stop("error", pr, "merge refused: " + (r.stderr or r.stdout).strip()[-300:])
+                pr["force"] = True
+                return self.poll["default"]
+            pr["status"] = "merged"
+            self.notify("Merged " + self.name(pr))
+            raise Stop("merged", pr)
+        return self.poll["fast"] if decision == "wait_fast" else self.poll["default"]
+
+    def run(self, seconds=0):
+        start = now()
+        prs = [p for p in self.s["prs"] if p.get("status") != "merged"]
+        if not prs:
+            raise Stop("error", detail="no PRs left to watch")
+        for p in prs:
+            p["next"], p["force"] = 0, True
+        while True:
+            if seconds and now() - start >= seconds:
+                return
+            due = [p for p in prs if p["next"] <= now()]
+            changed = []
+            for p in due:
+                c, _ = self.poll_rest(p)
+                stale = now() - p.get("gql_at", 0) >= (self.poll["approval"] if p.get("mode") == "approval" else 120)
+                if c or p.get("force") or stale:
+                    changed.append(p)
+            if changed:
+                for p, repo in zip(changed, self.query(changed)):
+                    p["force"], p["gql_at"] = False, now()
+                    p["decision"] = self.decide(p, repo)
+            for p in due:
+                decision, detail = p.get("decision", ("wait", ""))
+                self.say(p, decision, detail)
+                wait = self.act(p, decision, detail)
+                p["mode"] = decision
+                if decision in ("add_label", "retarget", "sync_base") or detail == "mergeability computing":
+                    p["force"] = True
+                p["next"] = now() + wait
+            self.save()
+            time.sleep(max(0.5, min(p["next"] for p in prs) - now()))
+
+
+def main(argv):
+    dry = "--dry-run" in argv
+    argv = [a for a in argv if a != "--dry-run"]
+    seconds = 0
+    if "--seconds" in argv:
+        i = argv.index("--seconds")
+        seconds = int(argv[i + 1])
+        del argv[i:i + 2]
+    repos, poll, sync_base = load_cfg()
+    os.makedirs(os.path.join(HOME, "merge"), exist_ok=True)
+    if argv[:1] == ["--run"]:
+        path = argv[1] if argv[1].endswith(".json") else os.path.join(HOME, "merge", argv[1] + ".json")
+        state = json.load(open(path))
+        pid = state.get("pid")
+        if pid and pid != os.getpid():
+            try:
+                os.kill(pid, 0)
+                print("EXIT error: run already watched by pid %s" % pid)
+                return 1
+            except OSError:
+                pass
+    else:
+        if not argv:
+            print(__doc__)
+            return 1
+        run = time.strftime("%Y%m%d-%H%M%S")
+        path = os.path.join(HOME, "merge", run + ".json")
+        state = {"run": run, "prs": []}
+        seen = set()
+        for ref in argv:
+            key, r, num = parse_ref(ref, repos)
+            if r["github"] in seen:
+                print("EXIT error: at most one PR per repo (%s)" % r["github"])
+                return 1
+            seen.add(r["github"])
+            state["prs"].append({"key": key, "slug": r["github"], "short": r["short"], "number": num,
+                                 "labels": r["labels"], "status": "watching"})
+    state["pid"], state["exit"] = os.getpid(), None
+    w = Watch(state, path, dry, repos, poll, sync_base)
+    log("%swatching %s, state %s" % ("DRY RUN " if dry else "", ", ".join("%s#%s" % (p["short"], p["number"]) for p in state["prs"]), "none" if dry else path))
+    code = 0
+    try:
+        w.run(seconds)
+        print("EXIT dry-run done")
+    except Stop as e:
+        ref = "%s#%s" % (e.pr["short"], e.pr["number"]) if e.pr else "-"
+        state["exit"] = {"reason": e.reason, "pr": ref, "detail": e.detail, "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+        print("EXIT %s %s %s state=%s" % (e.reason, ref, e.detail, path))
+        code = CODES.get(e.reason, 1)
+    except KeyboardInterrupt:
+        code = 130
+    state["pid"] = None
+    w.save()
+    print("requests=%d not_modified=%d graphql=%d" % (w.gh.n, w.gh.n304, w.gh.gql))
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

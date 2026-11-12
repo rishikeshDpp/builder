@@ -1,0 +1,15 @@
+{
+  "name": "builder",
+  "description": "Marketplace for the builder Claude Code plugin.",
+  "owner": {
+    "name": "rishikeshDpp"
+  },
+  "plugins": [
+    {
+      "name": "builder",
+      "description": "builder skills collection.",
+      "version": "0.1.0",
+      "source": "./"
+    }
+  ]
+}
