@@ -51,4 +51,6 @@ The watcher labels, retargets, merges the base (clean only), notifies once on mi
 - Edit, commit (no trailers, one-line comments), `git push` plain. Report sha and what changed.
 
 ## ClickUp after merge
-If the head branch has `CU-<id>`, a subagent moves that task to its list's done status (read the list's statuses; pick type `done`, else `closed`). No id → skip.
+If the head branch has `CU-<id>`, a subagent reads that task's list statuses and returns them. No id → skip.
+- Base is the default branch, main or master → move the task to the status matching "staging" (case-insensitive; prefer exact `staging`). None → list the statuses to the user, ask which, and wait.
+- Other base → move it to the done status (pick type `done`, else `closed`).
